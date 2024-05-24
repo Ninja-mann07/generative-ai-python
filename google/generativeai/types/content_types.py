@@ -1,3 +1,18 @@
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
@@ -5,10 +20,12 @@ import io
 import inspect
 import mimetypes
 import typing
-from typing import Any, Callable, TypedDict, Union
+from typing import Any, Callable, Union
+from typing_extensions import TypedDict
 
 import pydantic
 
+from google.generativeai.types import file_types
 from google.ai import generativelanguage as glm
 
 if typing.TYPE_CHECKING:
@@ -76,10 +93,9 @@ def image_to_blob(image) -> glm.Blob:
             name = image.filename
             if name is None:
                 raise ValueError(
-                    "Can only convert `IPython.display.Image` if "
-                    "it is constructed from a local file (Image(filename=...))."
+                    "Conversion failed. The `IPython.display.Image` can only be converted if "
+                    "it is constructed from a local file. Please ensure you are using the format: Image(filename='...')."
                 )
-
             mime_type, _ = mimetypes.guess_type(name)
             if mime_type is None:
                 mime_type = "image/unknown"
@@ -87,10 +103,10 @@ def image_to_blob(image) -> glm.Blob:
             return glm.Blob(mime_type=mime_type, data=image.data)
 
     raise TypeError(
-        "Could not convert image. expected an `Image` type"
-        "(`PIL.Image.Image` or `IPython.display.Image`).\n"
-        f"Got a: {type(image)}\n"
-        f"Value: {image}"
+        "Image conversion failed. The input was expected to be of type `Image` "
+        "(either `PIL.Image.Image` or `IPython.display.Image`).\n"
+        f"However, received an object of type: {type(image)}.\n"
+        f"Object Value: {image}"
     )
 
 
@@ -110,17 +126,19 @@ def _convert_dict(d: Mapping) -> glm.Content | glm.Part | glm.Blob:
         part = dict(d)
         if "inline_data" in part:
             part["inline_data"] = to_blob(part["inline_data"])
+        if "file_data" in part:
+            part["file_data"] = file_types.to_file_data(part["file_data"])
         return glm.Part(part)
     elif is_blob_dict(d):
         blob = d
         return glm.Blob(blob)
     else:
         raise KeyError(
-            "Could not recognize the intended type of the `dict`. "
-            "A `Content` should have a 'parts' key. "
-            "A `Part` should have a 'inline_data' or a 'text' key. "
-            "A `Blob` should have 'mime_type' and 'data' keys. "
-            f"Got keys: {list(d.keys())}"
+            "Unable to determine the intended type of the `dict`. "
+            "For `Content`, a 'parts' key is expected. "
+            "For `Part`, either an 'inline_data' or a 'text' key is expected. "
+            "For `Blob`, both 'mime_type' and 'data' keys are expected. "
+            f"However, the provided dictionary has the following keys: {list(d.keys())}"
         )
 
 
@@ -163,11 +181,25 @@ class PartDict(TypedDict):
 
 
 # When you need a `Part` accept a part object, part-dict, blob or string
-PartType = Union[glm.Part, PartDict, BlobType, str]
+PartType = Union[
+    glm.Part,
+    PartDict,
+    BlobType,
+    str,
+    glm.FunctionCall,
+    glm.FunctionResponse,
+    file_types.FileDataType,
+]
 
 
 def is_part_dict(d):
-    return "text" in d or "inline_data" in d
+    keys = list(d.keys())
+    if len(keys) != 1:
+        return False
+
+    key = keys[0]
+
+    return key in ["text", "inline_data", "function_call", "function_response", "file_data"]
 
 
 def to_part(part: PartType):
@@ -178,6 +210,15 @@ def to_part(part: PartType):
         return part
     elif isinstance(part, str):
         return glm.Part(text=part)
+    elif isinstance(part, glm.FileData):
+        return glm.Part(file_data=part)
+    elif isinstance(part, (glm.File, file_types.File)):
+        return glm.Part(file_data=file_types.to_file_data(part))
+    elif isinstance(part, glm.FunctionCall):
+        return glm.Part(function_call=part)
+    elif isinstance(part, glm.FunctionResponse):
+        return glm.Part(function_response=part)
+
     else:
         # Maybe it can be turned into a blob?
         return glm.Part(inline_data=to_blob(part))
@@ -202,7 +243,9 @@ StrictContentType = Union[glm.Content, ContentDict]
 
 def to_content(content: ContentType):
     if not content:
-        raise ValueError("content must not be empty")
+        raise ValueError(
+            "Invalid input: 'content' argument must not be empty. Please provide a non-empty value."
+        )
 
     if isinstance(content, Mapping):
         content = _convert_dict(content)
@@ -224,9 +267,9 @@ def strict_to_content(content: StrictContentType):
         return content
     else:
         raise TypeError(
-            "Expected a `glm.Content` or a `dict(parts=...)`.\n"
-            f"Got type: {type(content)}\n"
-            f"Value: {content}\n"
+            "Invalid input type. Expected a `glm.Content` or a `dict` with a 'parts' key.\n"
+            f"However, received an object of type: {type(content)}.\n"
+            f"Object Value: {content}"
         )
 
 
@@ -251,7 +294,12 @@ def to_contents(contents: ContentsType) -> list[glm.Content]:
     return contents
 
 
-def _generate_schema(
+def _schema_for_class(cls: TypedDict) -> dict[str, Any]:
+    schema = _build_schema("dummy", {"dummy": (cls, pydantic.Field())})
+    return schema["properties"]["dummy"]
+
+
+def _schema_for_function(
     f: Callable[..., Any],
     *,
     descriptions: Mapping[str, str] | None = None,
@@ -274,52 +322,36 @@ def _generate_schema(
     """
     if descriptions is None:
         descriptions = {}
-    if required is None:
-        required = []
     defaults = dict(inspect.signature(f).parameters)
-    fields_dict = {
-        name: (
-            # 1. We infer the argument type here: use Any rather than None so
-            # it will not try to auto-infer the type based on the default value.
-            (param.annotation if param.annotation != inspect.Parameter.empty else Any),
-            pydantic.Field(
-                # 2. We do not support default values for now.
-                # default=(
-                #     param.default if param.default != inspect.Parameter.empty
-                #     else None
-                # ),
-                # 3. We support user-provided descriptions.
-                description=descriptions.get(name, None),
-            ),
-        )
-        for name, param in defaults.items()
-        # We do not support *args or **kwargs
-        if param.kind
-        in (
+
+    fields_dict = {}
+    for name, param in defaults.items():
+        if param.kind in (
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
             inspect.Parameter.KEYWORD_ONLY,
             inspect.Parameter.POSITIONAL_ONLY,
-        )
-    }
-    parameters = pydantic.create_model(f.__name__, **fields_dict).schema()
-    # Postprocessing
-    # 4. Suppress unnecessary title generation:
-    #    * https://github.com/pydantic/pydantic/issues/1051
-    #    * http://cl/586221780
-    parameters.pop("title", None)
-    for name, function_arg in parameters.get("properties", {}).items():
-        function_arg.pop("title", None)
-        annotation = defaults[name].annotation
-        # 5. Nullable fields:
-        #     * https://github.com/pydantic/pydantic/issues/1270
-        #     * https://stackoverflow.com/a/58841311
-        #     * https://github.com/pydantic/pydantic/discussions/4872
-        if typing.get_origin(annotation) is typing.Union and type(None) in typing.get_args(
-            annotation
         ):
-            function_arg["nullable"] = True
+            # We do not support default values for now.
+            # default=(
+            #     param.default if param.default != inspect.Parameter.empty
+            #     else None
+            # ),
+            field = pydantic.Field(
+                # We support user-provided descriptions.
+                description=descriptions.get(name, None)
+            )
+
+            # 1. We infer the argument type here: use Any rather than None so
+            # it will not try to auto-infer the type based on the default value.
+            if param.annotation != inspect.Parameter.empty:
+                fields_dict[name] = param.annotation, field
+            else:
+                fields_dict[name] = Any, field
+
+    parameters = _build_schema(f.__name__, fields_dict)
+
     # 6. Annotate required fields.
-    if required:
+    if required is not None:
         # We use the user-provided "required" fields if specified.
         parameters["required"] = required
     else:
@@ -338,7 +370,116 @@ def _generate_schema(
             )
         ]
     schema = dict(name=f.__name__, description=f.__doc__, parameters=parameters)
+
     return schema
+
+
+def _build_schema(fname, fields_dict):
+    parameters = pydantic.create_model(fname, **fields_dict).schema()
+    defs = parameters.pop("$defs", {})
+    # flatten the defs
+    for name, value in defs.items():
+        unpack_defs(value, defs)
+    unpack_defs(parameters, defs)
+
+    # 5. Nullable fields:
+    #     * https://github.com/pydantic/pydantic/issues/1270
+    #     * https://stackoverflow.com/a/58841311
+    #     * https://github.com/pydantic/pydantic/discussions/4872
+    convert_to_nullable(parameters)
+    add_object_type(parameters)
+    # Postprocessing
+    # 4. Suppress unnecessary title generation:
+    #    * https://github.com/pydantic/pydantic/issues/1051
+    #    * http://cl/586221780
+    strip_titles(parameters)
+    return parameters
+
+
+def unpack_defs(schema, defs):
+    properties = schema["properties"]
+    for name, value in properties.items():
+        ref_key = value.get("$ref", None)
+        if ref_key is not None:
+            ref = defs[ref_key.split("defs/")[-1]]
+            unpack_defs(ref, defs)
+            properties[name] = ref
+            continue
+
+        anyof = value.get("anyOf", None)
+        if anyof is not None:
+            for i, atype in enumerate(anyof):
+                ref_key = atype.get("$ref", None)
+                if ref_key is not None:
+                    ref = defs[ref_key.split("defs/")[-1]]
+                    unpack_defs(ref, defs)
+                    anyof[i] = ref
+            continue
+
+        items = value.get("items", None)
+        if items is not None:
+            ref_key = items.get("$ref", None)
+            if ref_key is not None:
+                ref = defs[ref_key.split("defs/")[-1]]
+                unpack_defs(ref, defs)
+                value["items"] = ref
+                continue
+
+
+def strip_titles(schema):
+    title = schema.pop("title", None)
+
+    properties = schema.get("properties", None)
+    if properties is not None:
+        for name, value in properties.items():
+            strip_titles(value)
+
+    items = schema.get("items", None)
+    if items is not None:
+        strip_titles(items)
+
+
+def add_object_type(schema):
+    properties = schema.get("properties", None)
+    if properties is not None:
+        schema.pop("required", None)
+        schema["type"] = "object"
+        for name, value in properties.items():
+            add_object_type(value)
+
+    items = schema.get("items", None)
+    if items is not None:
+        add_object_type(items)
+
+
+def convert_to_nullable(schema):
+    anyof = schema.pop("anyOf", None)
+    if anyof is not None:
+        if len(anyof) != 2:
+            raise ValueError(
+                "Invalid input: Type Unions are not supported, except for `Optional` types. "
+                "Please provide an `Optional` type or a non-Union type."
+            )
+        a, b = anyof
+        if a == {"type": "null"}:
+            schema.update(b)
+        elif b == {"type": "null"}:
+            schema.update(a)
+        else:
+            raise ValueError(
+                "Invalid input: Type Unions are not supported, except for `Optional` types. "
+                "Please provide an `Optional` type or a non-Union type."
+            )
+        schema["nullable"] = True
+
+    properties = schema.get("properties", None)
+    if properties is not None:
+        for name, value in properties.items():
+            convert_to_nullable(value)
+
+    items = schema.get("items", None)
+    if items is not None:
+        convert_to_nullable(items)
 
 
 def _rename_schema_fields(schema):
@@ -411,7 +552,7 @@ class FunctionDeclaration:
         if descriptions is None:
             descriptions = {}
 
-        schema = _generate_schema(function, descriptions=descriptions)
+        schema = _schema_for_function(function, descriptions=descriptions)
 
         return CallableFunctionDeclaration(**schema, function=function)
 
@@ -466,8 +607,9 @@ def _make_function_declaration(
         return CallableFunctionDeclaration.from_function(fun)
     else:
         raise TypeError(
-            "Expected an instance of `genai.FunctionDeclaraionType`. Got a:\n" f"  {type(fun)=}\n",
-            fun,
+            "Invalid input type. Expected an instance of `genai.FunctionDeclarationType`.\n"
+            f"However, received an object of type: {type(fun)}.\n"
+            f"Object Value: {fun}"
         )
 
 
@@ -545,8 +687,9 @@ def _make_tool(tool: ToolType) -> Tool:
             return Tool(function_declarations=[tool])
         except Exception as e:
             raise TypeError(
-                "Expected an instance of `genai.ToolType`. Got a:\n" f"  {type(tool)=}",
-                tool,
+                "Invalid input type. Expected an instance of `genai.ToolType`.\n"
+                f"However, received an object of type: {type(tool)}.\n"
+                f"Object Value: {tool}"
             ) from e
 
 
@@ -562,8 +705,8 @@ class FunctionLibrary:
                 name = declaration.name
                 if name in self._index:
                     raise ValueError(
-                        f"A `FunctionDeclaration` named {name} is already defined. "
-                        "Each `FunctionDeclaration` must be uniquely named."
+                        f"Invalid operation: A `FunctionDeclaration` named '{name}' is already defined. "
+                        "Each `FunctionDeclaration` must have a unique name. Please use a different name."
                     )
                 self._index[declaration.name] = declaration
 
@@ -612,3 +755,85 @@ def to_function_library(lib: FunctionLibraryType | None) -> FunctionLibrary | No
         return lib
     else:
         return FunctionLibrary(tools=lib)
+
+
+FunctionCallingMode = glm.FunctionCallingConfig.Mode
+
+# fmt: off
+_FUNCTION_CALLING_MODE = {
+    1: FunctionCallingMode.AUTO,
+    FunctionCallingMode.AUTO: FunctionCallingMode.AUTO,
+    "mode_auto": FunctionCallingMode.AUTO,
+    "auto": FunctionCallingMode.AUTO,
+
+    2: FunctionCallingMode.ANY,
+    FunctionCallingMode.ANY: FunctionCallingMode.ANY,
+    "mode_any": FunctionCallingMode.ANY,
+    "any": FunctionCallingMode.ANY,
+
+    3: FunctionCallingMode.NONE,
+    FunctionCallingMode.NONE: FunctionCallingMode.NONE,
+    "mode_none": FunctionCallingMode.NONE,
+    "none": FunctionCallingMode.NONE,
+}
+# fmt: on
+
+FunctionCallingModeType = Union[FunctionCallingMode, str, int]
+
+
+def to_function_calling_mode(x: FunctionCallingModeType) -> FunctionCallingMode:
+    if isinstance(x, str):
+        x = x.lower()
+    return _FUNCTION_CALLING_MODE[x]
+
+
+class FunctionCallingConfigDict(TypedDict):
+    mode: FunctionCallingModeType
+    allowed_function_names: list[str]
+
+
+FunctionCallingConfigType = Union[
+    FunctionCallingModeType, FunctionCallingConfigDict, glm.FunctionCallingConfig
+]
+
+
+def to_function_calling_config(obj: FunctionCallingConfigType) -> glm.FunctionCallingConfig:
+    if isinstance(obj, glm.FunctionCallingConfig):
+        return obj
+    elif isinstance(obj, (FunctionCallingMode, str, int)):
+        obj = {"mode": to_function_calling_mode(obj)}
+    elif isinstance(obj, dict):
+        obj = obj.copy()
+        mode = obj.pop("mode")
+        obj["mode"] = to_function_calling_mode(mode)
+    else:
+        raise TypeError(
+            "Invalid input type. Failed to convert input to `glm.FunctionCallingConfig`.\n"
+            f"Received an object of type: {type(obj)}.\n"
+            f"Object Value: {obj}"
+        )
+
+    return glm.FunctionCallingConfig(obj)
+
+
+class ToolConfigDict:
+    function_calling_config: FunctionCallingConfigType
+
+
+ToolConfigType = Union[ToolConfigDict, glm.ToolConfig]
+
+
+def to_tool_config(obj: ToolConfigType) -> glm.ToolConfig:
+    if isinstance(obj, glm.ToolConfig):
+        return obj
+    elif isinstance(obj, dict):
+        fcc = obj.pop("function_calling_config")
+        fcc = to_function_calling_config(fcc)
+        obj["function_calling_config"] = fcc
+        return glm.ToolConfig(**obj)
+    else:
+        raise TypeError(
+            "Invalid input type. Failed to convert input to `glm.ToolConfig`.\n"
+            f"Received an object of type: {type(obj)}.\n"
+            f"Object Value: {obj}"
+        )

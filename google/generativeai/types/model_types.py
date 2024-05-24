@@ -29,6 +29,7 @@ import urllib.request
 from typing_extensions import TypedDict
 
 import google.ai.generativelanguage as glm
+from google.generativeai.types import permission_types
 from google.generativeai import string_utils
 
 
@@ -46,6 +47,17 @@ __all__ = [
 TunedModelState = glm.TunedModel.State
 
 TunedModelStateOptions = Union[None, str, int, TunedModelState]
+
+_TUNED_MODEL_VALID_NAME = r"[a-z](([a-z0-9-]{0,61}[a-z0-9])?)$"
+TUNED_MODEL_NAME_ERROR_MSG = """The `name` must consist of alphanumeric characters (or -) and be at most 63 characters; The name you entered:
+\tlen(name)== {length}
+\tname={name}
+"""
+
+
+def valid_tuned_model_name(name: str) -> bool:
+    return re.match(_TUNED_MODEL_VALID_NAME, name) is not None
+
 
 # fmt: off
 _TUNED_MODEL_STATES: dict[TunedModelStateOptions, TunedModelState] = {
@@ -183,6 +195,10 @@ class TunedModel:
     update_time: datetime.datetime | None = None
     tuning_task: TuningTask | None = None
 
+    @property
+    def permissions(self) -> permission_types.Permissions:
+        return permission_types.Permissions(self)
+
 
 @string_utils.prettyprint
 @dataclasses.dataclass
@@ -271,12 +287,18 @@ def _convert_dict(data, input_key, output_key):
     try:
         inputs = data[input_key]
     except KeyError:
-        raise KeyError(f'input_key is "{input_key}", but data has keys: {sorted(data.keys())}')
+        raise KeyError(
+            f"Invalid key: The input key '{input_key}' does not exist in the data. "
+            f"Available keys are: {sorted(data.keys())}."
+        )
 
     try:
         outputs = data[output_key]
     except KeyError:
-        raise KeyError(f'output_key is "{output_key}", but data has keys: {sorted(data.keys())}')
+        raise KeyError(
+            f"Invalid key: The output key '{output_key}' does not exist in the data. "
+            f"Available keys are: {sorted(data.keys())}."
+        )
 
     for i, o in zip(inputs, outputs):
         new_data.append(glm.TuningExample({"text_input": str(i), "output": str(o)}))
@@ -331,10 +353,14 @@ def make_model_name(name: AnyModelNameOptions):
     elif isinstance(name, str):
         name = name
     else:
-        raise TypeError("Expected: str, Model, or TunedModel")
+        raise TypeError(
+            "Invalid input type. Expected one of the following types: `str`, `Model`, or `TunedModel`."
+        )
 
     if not (name.startswith("models/") or name.startswith("tunedModels/")):
-        raise ValueError("Model names should start with `models/` or `tunedModels/`, got: {name}")
+        raise ValueError(
+            f"Invalid model name: '{name}'. Model names should start with 'models/' or 'tunedModels/'."
+        )
 
     return name
 

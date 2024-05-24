@@ -16,29 +16,27 @@ from __future__ import annotations
 
 import datetime
 import re
-import string
 import abc
 import dataclasses
 from typing import Any, AsyncIterable, Optional, Union, Iterable, Mapping
+from typing_extensions import deprecated  # type: ignore
 
 import google.ai.generativelanguage as glm
 
 from google.protobuf import field_mask_pb2
 from google.generativeai.client import get_default_retriever_client
 from google.generativeai.client import get_default_retriever_async_client
-from google.generativeai.client import get_dafault_permission_client
-from google.generativeai.client import get_dafault_permission_async_client
 from google.generativeai import string_utils
-from google.generativeai.types import safety_types
-from google.generativeai.types import citation_types
+from google.generativeai.types import helper_types
+
 from google.generativeai.types import permission_types
 from google.generativeai.types.model_types import idecode_time
 from google.generativeai.utils import flatten_update_paths
 
 _VALID_NAME = r"[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])$"
 NAME_ERROR_MSG = """The `name` must consist of alphanumeric characters (or -) and be 40 or fewer characters; or be empty. The name you entered:
-\tlen(name)== {length}
-\tname={name}
+    len(name)== {length}
+    name={name}
 """
 
 
@@ -149,7 +147,26 @@ def to_state(x: StateOptions) -> State:
 @dataclasses.dataclass
 class MetadataFilter:
     key: str
-    conditions: Condition
+    conditions: Iterable[Condition]
+
+    def _to_proto(self):
+        kwargs = {}
+        conditions = []
+        for c in self.conditions:
+            if isinstance(c.value, str):
+                kwargs["string_value"] = c.value
+            elif isinstance(c.value, (int, float)):
+                kwargs["numeric_value"] = float(c.value)
+            else:
+                raise ValueError(
+                    f"Invalid value type: The value for the condition must be either a string or an integer/float. Received: '{c.value}' of type {type(c.value).__name__}."
+                )
+            kwargs["operation"] = c.operation
+
+            condition = glm.Condition(**kwargs)
+            conditions.append(condition)
+
+        return glm.MetadataFilter(key=self.key, conditions=conditions)
 
 
 @string_utils.prettyprint
@@ -163,28 +180,64 @@ class Condition:
 @dataclasses.dataclass
 class CustomMetadata:
     key: str
-    string_value: Optional[str] = None
-    string_list_value: Optional[Iterable[str]] = None
-    numeric_value: Optional[float] = None
+    value: str | Iterable[str] | float
+
+    def _to_proto(self):
+        kwargs = {}
+        if isinstance(self.value, str):
+            kwargs["string_value"] = self.value
+        elif isinstance(self.value, Iterable):
+            if isinstance(self.value, Mapping):
+                # If already converted to a glm.StringList, get the values
+                kwargs["string_list_value"] = self.value
+            else:
+                kwargs["string_list_value"] = glm.StringList(values=self.value)
+        elif isinstance(self.value, (int, float)):
+            kwargs["numeric_value"] = float(self.value)
+        else:
+            raise ValueError(
+                f"Invalid value type: The value for a custom_metadata specification must be either a list of string values, a string, or an integer/float. Received: '{self.value}' of type {type(self.value).__name__}."
+            )
+        return glm.CustomMetadata(key=self.key, **kwargs)
+
+    @classmethod
+    def _from_dict(cls, cm):
+        key = cm["key"]
+        value = (
+            cm.get("value", None)
+            or cm.get("string_value", None)
+            or cm.get("string_list_value", None)
+            or cm.get("numeric_value", None)
+        )
+        return cls(key=key, value=value)
+
+    def _to_dict(self):
+        proto = self._to_proto()
+        return type(proto).to_dict(proto)
+
+
+CustomMetadataOptions = Union[CustomMetadata, glm.CustomMetadata, dict]
+
+
+def make_custom_metadata(cm: CustomMetadataOptions) -> CustomMetadata:
+    if isinstance(cm, CustomMetadata):
+        return cm
+
+    if isinstance(cm, glm.CustomMetadata):
+        cm = type(cm).to_dict(cm)
+
+    if isinstance(cm, dict):
+        return CustomMetadata._from_dict(cm)
+    else:
+        raise ValueError(  # nofmt
+            f"Invalid input: Could not create a 'CustomMetadata' from the provided input. Received type: '{type(cm).__name__}', value: '{cm}'."
+        )
 
 
 @string_utils.prettyprint
 @dataclasses.dataclass
 class ChunkData:
     string_value: str
-
-
-def create_metadata_filters(MetadataFilter):
-    metadata_filter = {
-        "key": MetadataFilter.key,
-        "conditions": [
-            {
-                "value": MetadataFilter.conditions.value,
-                "operation": to_operator(MetadataFilter.conditions.operation),
-            }
-        ],
-    }
-    return metadata_filter
 
 
 @string_utils.prettyprint
@@ -199,13 +252,17 @@ class Corpus:
     create_time: datetime.datetime
     update_time: datetime.datetime
 
+    @property
+    def permissions(self) -> permission_types.Permissions:
+        return permission_types.Permissions(self)
+
     def create_document(
         self,
-        name: Optional[str] = None,
-        display_name: Optional[str] = None,
-        custom_metadata: Optional[list[CustomMetadata]] = None,
+        name: str | None = None,
+        display_name: str | None = None,
+        custom_metadata: Iterable[CustomMetadata] | None = None,
         client: glm.RetrieverServiceClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ) -> Document:
         """
         Request to create a `Document`.
@@ -233,27 +290,15 @@ class Corpus:
         c_data = []
         if custom_metadata:
             for cm in custom_metadata:
-                if cm.string_list_value:
-                    c_data.append(
-                        glm.CustomMetadata(
-                            key=cm.key,
-                            string_list_value=glm.StringList(values=cm.string_list_value),
-                        )
-                    )
-                elif cm.string_value:
-                    c_data.append(glm.CustomMetadata(key=cm.key, string_value=cm.string_value))
-                elif cm.numeric_value:
-                    c_data.append(glm.CustomMetadata(key=cm.key, numeric_value=cm.numeric_value))
+                c_data.append(cm._to_proto())
 
-        document, document_name = None, None
         if name is None:
-            document = glm.Document(
-                name=document_name, display_name=display_name, custom_metadata=custom_metadata
-            )
+            document = glm.Document(display_name=display_name, custom_metadata=c_data)
         elif valid_name(name):
-            document_name = f"{self.name}/documents/{name}"
             document = glm.Document(
-                name=document_name, display_name=display_name, custom_metadata=custom_metadata
+                name=f"{self.name}/documents/{name}",
+                display_name=display_name,
+                custom_metadata=c_data,
             )
         else:
             raise ValueError(NAME_ERROR_MSG.format(length=len(name), name=name))
@@ -264,11 +309,11 @@ class Corpus:
 
     async def create_document_async(
         self,
-        name: Optional[str] = None,
-        display_name: Optional[str] = None,
-        custom_metadata: Optional[list[CustomMetadata]] = None,
+        name: str | None = None,
+        display_name: str | None = None,
+        custom_metadata: Iterable[CustomMetadata] | None = None,
         client: glm.RetrieverServiceAsyncClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ) -> Document:
         """This is the async version of `Corpus.create_document`."""
         if request_options is None:
@@ -281,27 +326,15 @@ class Corpus:
         c_data = []
         if custom_metadata:
             for cm in custom_metadata:
-                if cm.string_list_value:
-                    c_data.append(
-                        glm.CustomMetadata(
-                            key=cm.key,
-                            string_list_value=glm.StringList(values=cm.string_list_value),
-                        )
-                    )
-                elif cm.string_value:
-                    c_data.append(glm.CustomMetadata(key=cm.key, string_value=cm.string_value))
-                elif cm.numeric_value:
-                    c_data.append(glm.CustomMetadata(key=cm.key, numeric_value=cm.numeric_value))
+                c_data.append(cm._to_proto())
 
-        document, document_name = None, None
         if name is None:
-            document = glm.Document(
-                name=document_name, display_name=display_name, custom_metadata=custom_metadata
-            )
+            document = glm.Document(display_name=display_name, custom_metadata=c_data)
         elif valid_name(name):
-            document_name = f"{self.name}/documents/{name}"
             document = glm.Document(
-                name=document_name, display_name=display_name, custom_metadata=custom_metadata
+                name=f"{self.name}/documents/{name}",
+                display_name=display_name,
+                custom_metadata=c_data,
             )
         else:
             raise ValueError(NAME_ERROR_MSG.format(length=len(name), name=name))
@@ -314,7 +347,7 @@ class Corpus:
         self,
         name: str,
         client: glm.RetrieverServiceClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ) -> Document:
         """
         Get information about a specific `Document`.
@@ -343,7 +376,7 @@ class Corpus:
         self,
         name: str,
         client: glm.RetrieverServiceAsyncClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ) -> Document:
         """This is the async version of `Corpus.get_document`."""
         if request_options is None:
@@ -369,7 +402,7 @@ class Corpus:
         self,
         updates: dict[str, Any],
         client: glm.RetrieverServiceClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ):
         """
         Update a list of fields for a specified `Corpus`.
@@ -391,7 +424,9 @@ class Corpus:
         # At this time, only `display_name` can be updated
         for item in updates:
             if item != "display_name":
-                raise ValueError("At this time, only `display_name` can be updated for `Corpus`.")
+                raise ValueError(
+                    "Invalid operation: Currently, only the 'display_name' attribute can be updated for a 'Corpus'."
+                )
         field_mask = field_mask_pb2.FieldMask()
 
         for path in updates.keys():
@@ -407,7 +442,7 @@ class Corpus:
         self,
         updates: dict[str, Any],
         client: glm.RetrieverServiceAsyncClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ):
         """This is the async version of `Corpus.update`."""
         if request_options is None:
@@ -420,7 +455,9 @@ class Corpus:
         # At this time, only `display_name` can be updated
         for item in updates:
             if item != "display_name":
-                raise ValueError("At this time, only `display_name` can be updated for `Corpus`.")
+                raise ValueError(
+                    "Invalid operation: Currently, only the 'display_name' attribute can be updated for a 'Corpus'."
+                )
         field_mask = field_mask_pb2.FieldMask()
 
         for path in updates.keys():
@@ -435,10 +472,10 @@ class Corpus:
     def query(
         self,
         query: str,
-        metadata_filters: Optional[Iterable[MetadataFilter]] = None,
-        results_count: Optional[int] = None,
+        metadata_filters: Iterable[MetadataFilter] | None = None,
+        results_count: int | None = None,
         client: glm.RetrieverServiceClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ) -> Iterable[RelevantChunk]:
         """
         Query a corpus for information.
@@ -460,12 +497,14 @@ class Corpus:
 
         if results_count:
             if results_count > 100:
-                raise ValueError("Number of results returned must be between 1 and 100.")
+                raise ValueError(
+                    "Invalid operation: The number of results returned must be between 1 and 100."
+                )
 
         m_f_ = []
         if metadata_filters:
             for mf in metadata_filters:
-                m_f_.append(create_metadata_filters(mf))
+                m_f_.append(mf._to_proto())
 
         request = glm.QueryCorpusRequest(
             name=self.name,
@@ -489,10 +528,10 @@ class Corpus:
     async def query_async(
         self,
         query: str,
-        metadata_filters: Optional[Iterable[MetadataFilter]] = None,
-        results_count: Optional[int] = None,
+        metadata_filters: Iterable[MetadataFilter] | None = None,
+        results_count: int | None = None,
         client: glm.RetrieverServiceAsyncClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ) -> Iterable[RelevantChunk]:
         """This is the async version of `Corpus.query`."""
         if request_options is None:
@@ -503,12 +542,14 @@ class Corpus:
 
         if results_count:
             if results_count > 100:
-                raise ValueError("Number of results returned must be between 1 and 100.")
+                raise ValueError(
+                    "Invalid operation: The number of results returned must be between 1 and 100."
+                )
 
         m_f_ = []
         if metadata_filters:
             for mf in metadata_filters:
-                m_f_.append(create_metadata_filters(mf))
+                m_f_.append(mf._to_proto())
 
         request = glm.QueryCorpusRequest(
             name=self.name,
@@ -534,7 +575,7 @@ class Corpus:
         name: str,
         force: bool = False,
         client: glm.RetrieverServiceClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ):
         """
         Delete a document in the corpus.
@@ -561,7 +602,7 @@ class Corpus:
         name: str,
         force: bool = False,
         client: glm.RetrieverServiceAsyncClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ):
         """This is the async version of `Corpus.delete_document`."""
         if request_options is None:
@@ -578,9 +619,9 @@ class Corpus:
 
     def list_documents(
         self,
-        page_size: Optional[int] = None,
+        page_size: int | None = None,
         client: glm.RetrieverServiceClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ) -> Iterable[Document]:
         """
         List documents in corpus.
@@ -608,9 +649,9 @@ class Corpus:
 
     async def list_documents_async(
         self,
-        page_size: Optional[int] = None,
+        page_size: int | None = None,
         client: glm.RetrieverServiceAsyncClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ) -> AsyncIterable[Document]:
         """This is the async version of `Corpus.list_documents`."""
         if request_options is None:
@@ -626,37 +667,11 @@ class Corpus:
         async for doc in await client.list_documents(request, **request_options):
             yield decode_document(doc)
 
-    def _make_create_permission_request(
-        self,
-        role: permission_types.RoleOptions,
-        grantee_type: Optional[permission_types.GranteeTypeOptions] = None,
-        email_address: Optional[str] = None,
-    ) -> glm.CreatePermissionRequest:
-        role = permission_types.to_role(role)
-
-        if grantee_type:
-            grantee_type = permission_types.to_grantee_type(grantee_type)
-
-        if email_address and grantee_type == permission_types.GranteeType.EVERYONE:
-            raise ValueError(
-                f"Cannot limit access for: `{email_address}` when `grantee_type` is set to `EVERYONE`."
-            )
-
-        if not email_address and grantee_type != permission_types.GranteeType.EVERYONE:
-            raise ValueError(
-                f"`email_address` must be specified unless `grantee_type` is set to `EVERYONE`."
-            )
-
-        permission = glm.Permission(
-            role=role,
-            grantee_type=grantee_type,
-            email_address=email_address,
-        )
-        return glm.CreatePermissionRequest(
-            parent=self.name,
-            permission=permission,
-        )
-
+    # PERMISSIONS STUBS: ..deprecated:: >0.5.2
+    @deprecated(
+        "`Corpus.create_permission` is deprecated and will be removed in a future release. \
+            Corpus permissions are now managed using the `permissions` property. Use `Corpus.permissions.create` instead."
+    )
     def create_permission(
         self,
         role: permission_types.RoleOptions,
@@ -664,32 +679,14 @@ class Corpus:
         email_address: Optional[str] = None,
         client: glm.PermissionServiceClient | None = None,
     ) -> permission_types.Permission:
-        """
-        Create a new permission on a resource (self).
-
-        Args:
-            parent: The resource name of the parent resource in which the permission will be listed.
-            role: role that will be granted by the permission.
-            grantee_type: The type of the grantee for the permission.
-            email_address: The email address of the grantee.
-
-        Returns:
-            `permission_types.Permission` object with specified parent, role, grantee type, and email address.
-
-        Raises:
-            ValueError: When email_address is specified and grantee_type is set to EVERYONE.
-            ValueError: When email_address is not specified and grantee_type is not set to EVERYONE.
-        """
-        if client is None:
-            client = get_dafault_permission_client()
-
-        request = self._make_create_permission_request(
-            role=role, grantee_type=grantee_type, email_address=email_address
+        return self.permissions.create(
+            role=role, grantee_type=grantee_type, email_address=email_address, client=client
         )
-        permission_response = client.create_permission(request=request)
-        permission_response = type(permission_response).to_dict(permission_response)
-        return permission_types.Permission(**permission_response)
 
+    @deprecated(
+        "`Corpus.create_permission_async` is deprecated and will be removed in a future release. \
+            Corpus permissions are now managed using the `permissions` property. Use `Corpus.permissions.create_async` instead."
+    )
     async def create_permission_async(
         self,
         role: permission_types.RoleOptions,
@@ -697,57 +694,33 @@ class Corpus:
         email_address: Optional[str] = None,
         client: glm.PermissionServiceAsyncClient | None = None,
     ) -> permission_types.Permission:
-        """
-        This is the async version of `Corpus.create_permission`.
-        """
-        if client is None:
-            client = get_dafault_permission_async_client()
-
-        request = self._make_create_permission_request(
-            role=role, grantee_type=grantee_type, email_address=email_address
+        return await self.permissions.create_async(
+            role=role, grantee_type=grantee_type, email_address=email_address, client=client
         )
-        permission_response = await client.create_permission(request=request)
-        permission_response = type(permission_response).to_dict(permission_response)
-        return permission_types.Permission(**permission_response)
 
+    @deprecated(
+        "`Corpus.list_permission` is deprecated and will be removed in a future release. \
+            Corpus permissions are now managed using the `permissions` property. Use `Corpus.permissions.list` instead."
+    )
     def list_permissions(
         self,
         page_size: Optional[int] = None,
         client: glm.PermissionServiceClient | None = None,
     ) -> Iterable[permission_types.Permission]:
-        """
-        List `permission_types.Permission`s enforced on a resource (self).
+        return self.permissions.list(page_size=page_size, client=client)
 
-        Args:
-            parent: The resource name of the parent resource in which the permission will be listed.
-            page_size: The maximum number of permissions to return (per page). The service may return fewer permissions.
-
-        Returns:
-            Paginated list of `permission_types.Permission` objects.
-        """
-        if client is None:
-            client = get_dafault_permission_client()
-
-        request = glm.ListPermissionsRequest(parent=self.name, page_size=page_size)
-        for permission in client.list_permissions(request):
-            permission = type(permission).to_dict(permission)
-            yield permission_types.Permission(**permission)
-
+    @deprecated(
+        "`Corpus.list_permission_async` is deprecated and will be removed in a future release. \
+            Corpus permissions are now managed using the `permissions` property. Use `Corpus.permissions.list_async` instead."
+    )
     async def list_permissions_async(
         self,
         page_size: Optional[int] = None,
         client: glm.PermissionServiceAsyncClient | None = None,
     ) -> AsyncIterable[permission_types.Permission]:
-        """
-        This is the async version of `Corpus.list_permissions`.
-        """
-        if client is None:
-            client = get_dafault_permission_async_client()
+        return self.permissions.list_async(page_size=page_size, client=client)
 
-        request = glm.ListPermissionsRequest(parent=self.name, page_size=page_size)
-        async for permission in await client.list_permissions(request):
-            permission = type(permission).to_dict(permission)
-            yield permission_types.Permission(**permission)
+    # PERMISSIONS STUBS END
 
     def to_dict(self) -> dict[str, Any]:
         result = {"name": self.name, "display_name": self.display_name}
@@ -777,10 +750,10 @@ class Document(abc.ABC):
     def create_chunk(
         self,
         data: str | ChunkData,
-        name: Optional[str] = None,
-        custom_metadata: Optional[list[CustomMetadata]] = None,
+        name: str | None = None,
+        custom_metadata: Iterable[CustomMetadata] | None = None,
         client: glm.RetrieverServiceClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ) -> Chunk:
         """
         Create a `Chunk` object which has textual data.
@@ -804,36 +777,26 @@ class Document(abc.ABC):
         if client is None:
             client = get_default_retriever_client()
 
-        chunk_name, chunk = None, None
-        if name is None:
-            chunk_name = None
-        elif valid_name(name):
-            chunk_name = f"{self.name}/chunks/{name}"
-        else:
-            raise ValueError(NAME_ERROR_MSG.format(length=len(name), name=name))
-
         # Handle the custom_metadata parameter
         c_data = []
         if custom_metadata:
             for cm in custom_metadata:
-                if cm.string_list_value:
-                    c_data.append(
-                        glm.CustomMetadata(
-                            key=cm.key,
-                            string_list_value=glm.StringList(values=cm.string_list_value),
-                        )
-                    )
-                elif cm.string_value:
-                    c_data.append(glm.CustomMetadata(key=cm.key, string_value=cm.string_value))
-                elif cm.numeric_value:
-                    c_data.append(glm.CustomMetadata(key=cm.key, numeric_value=cm.numeric_value))
+                c_data.append(cm._to_proto())
+
+        if name is not None:
+            if valid_name(name):
+                chunk_name = f"{self.name}/chunks/{name}"
+            else:
+                raise ValueError(NAME_ERROR_MSG.format(length=len(name), name=name))
+        else:
+            chunk_name = name
 
         if isinstance(data, str):
             chunk = glm.Chunk(name=chunk_name, data={"string_value": data}, custom_metadata=c_data)
         else:
             chunk = glm.Chunk(
                 name=chunk_name,
-                data={"string_value": data},
+                data={"string_value": data.string_value},
                 custom_metadata=c_data,
             )
 
@@ -844,10 +807,10 @@ class Document(abc.ABC):
     async def create_chunk_async(
         self,
         data: str | ChunkData,
-        name: Optional[str] = None,
-        custom_metadata: Optional[list[CustomMetadata]] = None,
+        name: str | None = None,
+        custom_metadata: Iterable[CustomMetadata] | None = None,
         client: glm.RetrieverServiceAsyncClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ) -> Chunk:
         """This is the async version of `Document.create_chunk`."""
         if request_options is None:
@@ -856,36 +819,26 @@ class Document(abc.ABC):
         if client is None:
             client = get_default_retriever_async_client()
 
-        chunk_name, chunk = None, None
-        if name is None:
-            chunk_name = None
-        elif valid_name(name):
-            chunk_name = f"{self.name}/chunks/{name}"
-        else:
-            raise ValueError(NAME_ERROR_MSG.format(length=len(name), name=name))
-
         # Handle the custom_metadata parameter
         c_data = []
         if custom_metadata:
             for cm in custom_metadata:
-                if cm.string_list_value:
-                    c_data.append(
-                        glm.CustomMetadata(
-                            key=cm.key,
-                            string_list_value=glm.StringList(values=cm.string_list_value),
-                        )
-                    )
-                elif cm.string_value:
-                    c_data.append(glm.CustomMetadata(key=cm.key, string_value=cm.string_value))
-                elif cm.numeric_value:
-                    c_data.append(glm.CustomMetadata(key=cm.key, numeric_value=cm.numeric_value))
+                c_data.append(cm._to_proto())
+
+        if name is not None:
+            if valid_name(name):
+                chunk_name = f"{self.name}/chunks/{name}"
+            else:
+                raise ValueError(NAME_ERROR_MSG.format(length=len(name), name=name))
+        else:
+            chunk_name = name
 
         if isinstance(data, str):
             chunk = glm.Chunk(name=chunk_name, data={"string_value": data}, custom_metadata=c_data)
         else:
             chunk = glm.Chunk(
                 name=chunk_name,
-                data={"string_value": data},
+                data={"string_value": data.string_value},
                 custom_metadata=c_data,
             )
 
@@ -923,7 +876,7 @@ class Document(abc.ABC):
             return glm.Chunk(chunk)
         else:
             raise TypeError(
-                f"Could not convert instance of `{type(chunk)}` chunk:" f"value: {chunk}"
+                f"Invalid input: Could not convert instance of type '{type(chunk).__name__}' to a chunk. Received value: '{chunk}'."
             )
 
     def _make_batch_create_chunk_request(
@@ -956,7 +909,7 @@ class Document(abc.ABC):
         self,
         chunks: BatchCreateChunkOptions,
         client: glm.RetrieverServiceClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ):
         """
         Create chunks within the given document.
@@ -982,7 +935,7 @@ class Document(abc.ABC):
         self,
         chunks: BatchCreateChunkOptions,
         client: glm.RetrieverServiceAsyncClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ):
         """This is the async version of `Document.batch_create_chunk`."""
         if request_options is None:
@@ -999,7 +952,7 @@ class Document(abc.ABC):
         self,
         name: str,
         client: glm.RetrieverServiceClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ):
         """
         Get information about a specific chunk.
@@ -1028,7 +981,7 @@ class Document(abc.ABC):
         self,
         name: str,
         client: glm.RetrieverServiceAsyncClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ):
         """This is the async version of `Document.get_chunk`."""
         if request_options is None:
@@ -1046,9 +999,9 @@ class Document(abc.ABC):
 
     def list_chunks(
         self,
-        page_size: Optional[int] = None,
+        page_size: int | None = None,
         client: glm.RetrieverServiceClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ) -> Iterable[Chunk]:
         """
         List chunks of a document.
@@ -1072,9 +1025,9 @@ class Document(abc.ABC):
 
     async def list_chunks_async(
         self,
-        page_size: Optional[int] = None,
+        page_size: int | None = None,
         client: glm.RetrieverServiceClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ) -> AsyncIterable[Chunk]:
         """This is the async version of `Document.list_chunks`."""
         if request_options is None:
@@ -1090,10 +1043,10 @@ class Document(abc.ABC):
     def query(
         self,
         query: str,
-        metadata_filters: Optional[Iterable[MetadataFilter]] = None,
-        results_count: Optional[int] = None,
+        metadata_filters: Iterable[MetadataFilter] | None = None,
+        results_count: int | None = None,
         client: glm.RetrieverServiceClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ) -> list[RelevantChunk]:
         """
         Query a `Document` in the `Corpus` for information.
@@ -1114,12 +1067,14 @@ class Document(abc.ABC):
 
         if results_count:
             if results_count < 0 or results_count >= 100:
-                raise ValueError("Number of results returned must be between 1 and 100.")
+                raise ValueError(
+                    "Invalid operation: The number of results returned must be between 1 and 100."
+                )
 
         m_f_ = []
         if metadata_filters:
             for mf in metadata_filters:
-                m_f_.append(create_metadata_filters(mf))
+                m_f_.append(mf._to_proto())
 
         request = glm.QueryDocumentRequest(
             name=self.name,
@@ -1143,10 +1098,10 @@ class Document(abc.ABC):
     async def query_async(
         self,
         query: str,
-        metadata_filters: Optional[Iterable[MetadataFilter]] = None,
-        results_count: Optional[int] = None,
+        metadata_filters: Iterable[MetadataFilter] | None = None,
+        results_count: int | None = None,
         client: glm.RetrieverServiceAsyncClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ) -> list[RelevantChunk]:
         """This is the async version of `Document.query`."""
         if request_options is None:
@@ -1157,12 +1112,14 @@ class Document(abc.ABC):
 
         if results_count:
             if results_count < 0 or results_count >= 100:
-                raise ValueError("Number of results returned must be between 1 and 100.")
+                raise ValueError(
+                    "Invalid operation: The number of results returned must be between 1 and 100."
+                )
 
         m_f_ = []
         if metadata_filters:
             for mf in metadata_filters:
-                m_f_.append(create_metadata_filters(mf))
+                m_f_.append(mf._to_proto())
 
         request = glm.QueryDocumentRequest(
             name=self.name,
@@ -1193,7 +1150,7 @@ class Document(abc.ABC):
         self,
         updates: dict[str, Any],
         client: glm.RetrieverServiceClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ):
         """
         Update a list of fields for a specified document.
@@ -1215,7 +1172,9 @@ class Document(abc.ABC):
         # At this time, only `display_name` can be updated
         for item in updates:
             if item != "display_name":
-                raise ValueError("At this time, only `display_name` can be updated for `Document`.")
+                raise ValueError(
+                    "Invalid operation: Currently, only the 'display_name' attribute can be updated for a 'Document'."
+                )
         field_mask = field_mask_pb2.FieldMask()
         for path in updates.keys():
             field_mask.paths.append(path)
@@ -1230,7 +1189,7 @@ class Document(abc.ABC):
         self,
         updates: dict[str, Any],
         client: glm.RetrieverServiceAsyncClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ):
         """This is the async version of `Document.update`."""
         if request_options is None:
@@ -1243,7 +1202,9 @@ class Document(abc.ABC):
         # At this time, only `display_name` can be updated
         for item in updates:
             if item != "display_name":
-                raise ValueError("At this time, only `display_name` can be updated for `Document`.")
+                raise ValueError(
+                    "Invalid operation: Currently, only the 'display_name' attribute can be updated for a 'Document'."
+                )
         field_mask = field_mask_pb2.FieldMask()
         for path in updates.keys():
             field_mask.paths.append(path)
@@ -1258,7 +1219,7 @@ class Document(abc.ABC):
         self,
         chunks: BatchUpdateChunksOptions,
         client: glm.RetrieverServiceClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ):
         """
         Update multiple chunks within the same document.
@@ -1276,7 +1237,6 @@ class Document(abc.ABC):
         if client is None:
             client = get_default_retriever_client()
 
-        # TODO (@snkancharla): Add idecode_time here in each conditional loop?
         if isinstance(chunks, glm.BatchUpdateChunksRequest):
             response = client.batch_update_chunks(chunks)
             response = type(response).to_dict(response)
@@ -1286,14 +1246,32 @@ class Document(abc.ABC):
         if isinstance(chunks, Mapping):
             # Key is name of chunk, value is a dictionary of updates
             for key, value in chunks.items():
-                c = self.get_chunk(name=key)
+                chunk_to_update = self.get_chunk(name=key)
+
+                # Handle the custom_metadata parameter
+                c_data = []
+                if chunk_to_update.custom_metadata:
+                    for cm in chunk_to_update.custom_metadata:
+                        c_data.append(cm._to_proto())
+
+                # When handling updates, use to the _to_proto result of the custom_metadata
+                chunk_to_update.custom_metadata = c_data
+
                 updates = flatten_update_paths(value)
+                # At this time, only `data` can be updated
+                for item in updates:
+                    if item != "data.string_value":
+                        raise ValueError(
+                            f"Invalid operation: Currently, only the 'data' attribute can be updated for a 'Chunk'. Attempted to update '{item}'."
+                        )
                 field_mask = field_mask_pb2.FieldMask()
                 for path in updates.keys():
                     field_mask.paths.append(path)
                 for path, value in updates.items():
-                    c._apply_update(path, value)
-                _requests.append(glm.UpdateChunkRequest(chunk=c.to_dict(), update_mask=field_mask))
+                    chunk_to_update._apply_update(path, value)
+                _requests.append(
+                    glm.UpdateChunkRequest(chunk=chunk_to_update.to_dict(), update_mask=field_mask)
+                )
             request = glm.BatchUpdateChunksRequest(parent=self.name, requests=_requests)
             response = client.batch_update_chunks(request, **request_options)
             response = type(response).to_dict(response)
@@ -1304,18 +1282,29 @@ class Document(abc.ABC):
                     _requests.append(chunk)
                 elif isinstance(chunk, tuple):
                     # First element is name of chunk, second element contains updates
-                    c = self.get_chunk(name=chunk[0])
+                    chunk_to_update = self.get_chunk(name=chunk[0])
+
+                    # Handle the custom_metadata parameter
+                    c_data = []
+                    if chunk_to_update.custom_metadata:
+                        for cm in chunk_to_update.custom_metadata:
+                            c_data.append(cm._to_proto())
+
+                    # When handling updates, use to the _to_proto result of the custom_metadata
+                    chunk_to_update.custom_metadata = c_data
+
                     updates = flatten_update_paths(chunk[1])
                     field_mask = field_mask_pb2.FieldMask()
                     for path in updates.keys():
                         field_mask.paths.append(path)
                     for path, value in updates.items():
-                        c._apply_update(path, value)
-                    _requests.append({"chunk": c.to_dict(), "update_mask": field_mask})
+                        chunk_to_update._apply_update(path, value)
+                    _requests.append(
+                        {"chunk": chunk_to_update.to_dict(), "update_mask": field_mask}
+                    )
                 else:
                     raise TypeError(
-                        "The `chunks` parameter must be a list of glm.UpdateChunkRequests,"
-                        "dictionaries, or tuples of dictionaries."
+                        "Invalid input: The 'chunks' parameter must be a list of 'glm.UpdateChunkRequests', dictionaries, or tuples of dictionaries."
                     )
             request = glm.BatchUpdateChunksRequest(parent=self.name, requests=_requests)
             response = client.batch_update_chunks(request, **request_options)
@@ -1326,7 +1315,7 @@ class Document(abc.ABC):
         self,
         chunks: BatchUpdateChunksOptions,
         client: glm.RetrieverServiceAsyncClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ):
         """This is the async version of `Document.batch_update_chunks`."""
         if request_options is None:
@@ -1335,9 +1324,8 @@ class Document(abc.ABC):
         if client is None:
             client = get_default_retriever_async_client()
 
-        # TODO (@snkancharla): Add idecode_time here in each conditional loop?
         if isinstance(chunks, glm.BatchUpdateChunksRequest):
-            response = await client.batch_update_chunks(chunks)
+            response = client.batch_update_chunks(chunks)
             response = type(response).to_dict(response)
             return response
 
@@ -1345,14 +1333,32 @@ class Document(abc.ABC):
         if isinstance(chunks, Mapping):
             # Key is name of chunk, value is a dictionary of updates
             for key, value in chunks.items():
-                c = self.get_chunk(name=key)
+                chunk_to_update = self.get_chunk(name=key)
+
+                # Handle the custom_metadata parameter
+                c_data = []
+                if chunk_to_update.custom_metadata:
+                    for cm in chunk_to_update.custom_metadata:
+                        c_data.append(cm._to_proto())
+
+                # When handling updates, use to the _to_proto result of the custom_metadata
+                chunk_to_update.custom_metadata = c_data
+
                 updates = flatten_update_paths(value)
+                # At this time, only `data` can be updated
+                for item in updates:
+                    if item != "data.string_value":
+                        raise ValueError(
+                            f"Invalid operation: Currently, only the 'data' attribute can be updated for a 'Chunk'. Attempted to update '{item}'."
+                        )
                 field_mask = field_mask_pb2.FieldMask()
                 for path in updates.keys():
                     field_mask.paths.append(path)
                 for path, value in updates.items():
-                    c._apply_update(path, value)
-                _requests.append(glm.UpdateChunkRequest(chunk=c.to_dict(), update_mask=field_mask))
+                    chunk_to_update._apply_update(path, value)
+                _requests.append(
+                    glm.UpdateChunkRequest(chunk=chunk_to_update.to_dict(), update_mask=field_mask)
+                )
             request = glm.BatchUpdateChunksRequest(parent=self.name, requests=_requests)
             response = await client.batch_update_chunks(request, **request_options)
             response = type(response).to_dict(response)
@@ -1363,18 +1369,29 @@ class Document(abc.ABC):
                     _requests.append(chunk)
                 elif isinstance(chunk, tuple):
                     # First element is name of chunk, second element contains updates
-                    c = self.get_chunk(name=chunk[0])
+                    chunk_to_update = self.get_chunk(name=chunk[0])
+
+                    # Handle the custom_metadata parameter
+                    c_data = []
+                    if chunk_to_update.custom_metadata:
+                        for cm in chunk_to_update.custom_metadata:
+                            c_data.append(cm._to_proto())
+
+                    # When handling updates, use to the _to_proto result of the custom_metadata
+                    chunk_to_update.custom_metadata = c_data
+
                     updates = flatten_update_paths(chunk[1])
                     field_mask = field_mask_pb2.FieldMask()
                     for path in updates.keys():
                         field_mask.paths.append(path)
                     for path, value in updates.items():
-                        c._apply_update(path, value)
-                    _requests.append({"chunk": c.to_dict(), "update_mask": field_mask})
+                        chunk_to_update._apply_update(path, value)
+                    _requests.append(
+                        {"chunk": chunk_to_update.to_dict(), "update_mask": field_mask}
+                    )
                 else:
                     raise TypeError(
-                        "The `chunks` parameter must be a list of glm.UpdateChunkRequests,"
-                        "dictionaries, or tuples of dictionaries."
+                        "Invalid input: The 'chunks' parameter must be a list of 'glm.UpdateChunkRequests', dictionaries, or tuples of dictionaries."
                     )
             request = glm.BatchUpdateChunksRequest(parent=self.name, requests=_requests)
             response = await client.batch_update_chunks(request, **request_options)
@@ -1385,7 +1402,7 @@ class Document(abc.ABC):
         self,
         name: str,
         client: glm.RetrieverServiceClient | None = None,
-        request_options: dict[str, Any] | None = None,  # fmt: {}
+        request_options: helper_types.RequestOptionsType | None = None,  # fmt: {}
     ):
         """
         Delete a `Chunk`.
@@ -1410,7 +1427,7 @@ class Document(abc.ABC):
         self,
         name: str,
         client: glm.RetrieverServiceAsyncClient | None = None,
-        request_options: dict[str, Any] | None = None,  # fmt: {}
+        request_options: helper_types.RequestOptionsType | None = None,  # fmt: {}
     ):
         """This is the async version of `Document.delete_chunk`."""
         if request_options is None:
@@ -1429,7 +1446,7 @@ class Document(abc.ABC):
         self,
         chunks: BatchDeleteChunkOptions,
         client: glm.RetrieverServiceClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ):
         """
         Delete multiple `Chunk`s from a document.
@@ -1455,14 +1472,14 @@ class Document(abc.ABC):
             client.batch_delete_chunks(request, **request_options)
         else:
             raise ValueError(
-                "To delete chunks, you must pass in either the names of the chunks as an iterable, or multiple `glm.DeleteChunkRequest`s."
+                "Invalid operation: To delete chunks, you must pass in either the names of the chunks as an iterable, or multiple 'glm.DeleteChunkRequest's."
             )
 
     async def batch_delete_chunks_async(
         self,
         chunks: BatchDeleteChunkOptions,
         client: glm.RetrieverServiceAsyncClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ):
         """This is the async version of `Document.batch_delete_chunks`."""
         if request_options is None:
@@ -1482,7 +1499,7 @@ class Document(abc.ABC):
             await client.batch_delete_chunks(request, **request_options)
         else:
             raise ValueError(
-                "To delete chunks, you must pass in either the names of the chunks as an iterable, or multiple `glm.DeleteChunkRequest`s."
+                "Invalid operation: To delete chunks, you must pass in either the names of the chunks as an iterable, or multiple 'glm.DeleteChunkRequest's."
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1536,10 +1553,11 @@ class Chunk(abc.ABC):
             self.data = ChunkData(string_value=data)
         elif isinstance(data, dict):
             self.data = ChunkData(string_value=data["string_value"])
+
         if custom_metadata is None:
             self.custom_metadata = []
         else:
-            self.custom_metadata = [CustomMetadata(*cm) for cm in custom_metadata]
+            self.custom_metadata = [make_custom_metadata(cm) for cm in custom_metadata]
 
         self.state = to_state(state)
 
@@ -1567,7 +1585,7 @@ class Chunk(abc.ABC):
         self,
         updates: dict[str, Any],
         client: glm.RetrieverServiceClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ):
         """
         Update a list of fields for a specified `Chunk`.
@@ -1585,12 +1603,21 @@ class Chunk(abc.ABC):
         if client is None:
             client = get_default_retriever_client()
 
+        # Handle the custom_metadata parameter
+        c_data = []
+        if self.custom_metadata:
+            for cm in self.custom_metadata:
+                c_data.append(cm._to_proto())
+
+        # When handling updates, use to the _to_proto result of the custom_metadata
+        self.custom_metadata = c_data
+
         updates = flatten_update_paths(updates)
         # At this time, only `data` can be updated
         for item in updates:
             if item != "data.string_value":
                 raise ValueError(
-                    f"At this time, only `data` can be updated for `Chunk`. Got {item}."
+                    f"Invalid operation: Currently, only the 'data' attribute can be updated for a 'Chunk'. Attempted to update '{item}'."
                 )
         field_mask = field_mask_pb2.FieldMask()
 
@@ -1599,6 +1626,7 @@ class Chunk(abc.ABC):
         for path, value in updates.items():
             self._apply_update(path, value)
         request = glm.UpdateChunkRequest(chunk=self.to_dict(), update_mask=field_mask)
+
         client.update_chunk(request, **request_options)
         return self
 
@@ -1606,7 +1634,7 @@ class Chunk(abc.ABC):
         self,
         updates: dict[str, Any],
         client: glm.RetrieverServiceAsyncClient | None = None,
-        request_options: dict[str, Any] | None = None,
+        request_options: helper_types.RequestOptionsType | None = None,
     ):
         """This is the async version of `Chunk.update`."""
         if request_options is None:
@@ -1615,12 +1643,21 @@ class Chunk(abc.ABC):
         if client is None:
             client = get_default_retriever_async_client()
 
+        # Handle the custom_metadata parameter
+        c_data = []
+        if self.custom_metadata:
+            for cm in self.custom_metadata:
+                c_data.append(cm._to_proto())
+
+        # When handling updates, use to the _to_proto result of the custom_metadata
+        self.custom_metadata = c_data
+
         updates = flatten_update_paths(updates)
         # At this time, only `data` can be updated
         for item in updates:
             if item != "data.string_value":
                 raise ValueError(
-                    f"At this time, only `data` can be updated for `Chunk`. Got {item}."
+                    f"Invalid operation: Currently, only the 'data' attribute can be updated for a 'Chunk'. Attempted to update '{item}'."
                 )
         field_mask = field_mask_pb2.FieldMask()
 
@@ -1629,6 +1666,7 @@ class Chunk(abc.ABC):
         for path, value in updates.items():
             self._apply_update(path, value)
         request = glm.UpdateChunkRequest(chunk=self.to_dict(), update_mask=field_mask)
+
         await client.update_chunk(request, **request_options)
         return self
 
@@ -1636,7 +1674,7 @@ class Chunk(abc.ABC):
         result = {
             "name": self.name,
             "data": dataclasses.asdict(self.data),
-            "custom_metadata": [dataclasses.asdict(cm) for cm in self.custom_metadata],
+            "custom_metadata": [cm._to_dict() for cm in self.custom_metadata],
             "state": self.state,
         }
         return result

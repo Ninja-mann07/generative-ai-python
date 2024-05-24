@@ -1,19 +1,39 @@
+# -*- coding: utf-8 -*-
+# Copyright 2023 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import collections
 import contextlib
 import sys
-from collections.abc import Iterable, AsyncIterable
+from collections.abc import Iterable, AsyncIterable, Mapping
 import dataclasses
 import itertools
+import json
+import sys
 import textwrap
-from typing import TypedDict, Union
+from typing import Union, Any
+from typing_extensions import TypedDict
+import types
 
 import google.protobuf.json_format
 import google.api_core.exceptions
 
 from google.ai import generativelanguage as glm
 from google.generativeai import string_utils
+from google.generativeai.types import content_types
+from google.generativeai.responder import _rename_schema_fields
 
 __all__ = [
     "AsyncGenerateContentResponse",
@@ -58,12 +78,14 @@ class BrokenResponseError(Exception):
     pass
 
 
-class GenerationConfigDict(TypedDict):
+class GenerationConfigDict(TypedDict, total=False):
     # TODO(markdaoust): Python 3.11+ use `NotRequired`, ref: https://peps.python.org/pep-0655/
     candidate_count: int
     stop_sequences: Iterable[str]
     max_output_tokens: int
     temperature: float
+    response_mime_type: str
+    response_schema: glm.Schema | Mapping[str, Any]  # fmt: off
 
 
 @dataclasses.dataclass
@@ -87,7 +109,6 @@ class GenerationConfig:
             in the model's specification.
         temperature:
             Controls the randomness of the output. Note: The
-
             default value varies by model, see the `Model.temperature`
             attribute of the `Model` returned the `genai.get_model`
             function.
@@ -124,6 +145,17 @@ class GenerationConfig:
             Note: The default value varies by model, see the
             `Model.top_k` attribute of the `Model` returned the
             `genai.get_model` function.
+
+        response_mime_type:
+            Optional. Output response mimetype of the generated candidate text.
+
+            Supported mimetype:
+                `text/plain`: (default) Text output.
+                `application/json`: JSON response in the candidates.
+
+        response_schema:
+            Optional. Specifies the format of the JSON requested if response_mime_type is
+            `application/json`.
     """
 
     candidate_count: int | None = None
@@ -132,26 +164,59 @@ class GenerationConfig:
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
+    response_mime_type: str | None = None
+    response_schema: glm.Schema | Mapping[str, Any] | None = None
 
 
 GenerationConfigType = Union[glm.GenerationConfig, GenerationConfigDict, GenerationConfig]
+
+
+def _normalize_schema(generation_config):
+    # Convert response_schema to glm.Schema for request
+    response_schema = generation_config.get("response_schema", None)
+    if response_schema is None:
+        return
+
+    if isinstance(response_schema, glm.Schema):
+        return
+
+    if isinstance(response_schema, type):
+        response_schema = content_types._schema_for_class(response_schema)
+    elif isinstance(response_schema, types.GenericAlias):
+        if not str(response_schema).startswith("list["):
+            raise ValueError(
+                f"Invalid input: Could not understand the type of '{response_schema}'. "
+                "Expected one of the following types: `int`, `float`, `str`, `bool`, `typing_extensions.TypedDict`, `dataclass`, or `list[...]`."
+            )
+        response_schema = content_types._schema_for_class(response_schema)
+
+    response_schema = _rename_schema_fields(response_schema)
+    generation_config["response_schema"] = glm.Schema(response_schema)
 
 
 def to_generation_config_dict(generation_config: GenerationConfigType):
     if generation_config is None:
         return {}
     elif isinstance(generation_config, glm.GenerationConfig):
-        return type(generation_config).to_dict(generation_config)  # pytype: disable=attribute-error
+        schema = generation_config.response_schema
+        generation_config = type(generation_config).to_dict(
+            generation_config
+        )  # pytype: disable=attribute-error
+        generation_config["response_schema"] = schema
+        return generation_config
     elif isinstance(generation_config, GenerationConfig):
         generation_config = dataclasses.asdict(generation_config)
+        _normalize_schema(generation_config)
         return {key: value for key, value in generation_config.items() if value is not None}
     elif hasattr(generation_config, "keys"):
-        return dict(generation_config)
+        generation_config = dict(generation_config)
+        _normalize_schema(generation_config)
+        return generation_config
     else:
         raise TypeError(
-            "Did not understand `generation_config`, expected a `dict` or"
-            f" `GenerationConfig`\nGot type: {type(generation_config)}\nValue:"
-            f" {generation_config}"
+            "Invalid input type. Expected a `dict` or `GenerationConfig` for `generation_config`.\n"
+            f"However, received an object of type: {type(generation_config)}.\n"
+            f"Object Value: {generation_config}"
         )
 
 
@@ -227,6 +292,7 @@ def _join_candidates(candidates: Iterable[glm.Candidate]):
         finish_reason=candidates[-1].finish_reason,
         safety_ratings=_join_safety_ratings_lists([c.safety_ratings for c in candidates]),
         citation_metadata=_join_citation_metadatas([c.citation_metadata for c in candidates]),
+        token_count=candidates[-1].token_count,
     )
 
 
@@ -253,9 +319,11 @@ def _join_prompt_feedbacks(
 
 
 def _join_chunks(chunks: Iterable[glm.GenerateContentResponse]):
+    chunks = tuple(chunks)
     return glm.GenerateContentResponse(
         candidates=_join_candidate_lists(c.candidates for c in chunks),
         prompt_feedback=_join_prompt_feedbacks(c.prompt_feedback for c in chunks),
+        usage_metadata=chunks[-1].usage_metadata,
     )
 
 
@@ -288,6 +356,18 @@ class BaseGenerateContentResponse:
         else:
             self._error = None
 
+    def to_dict(self):
+        """Returns the result as a JSON-compatible dict.
+
+        Note: This doesn't capture the iterator state when streaming, it only captures the accumulated
+        `GenerateContentResponse` fields.
+
+        >>> import json
+        >>> response = model.generate_content('Hello?')
+        >>> json.dumps(response.to_dict())
+        """
+        return type(self._result).to_dict(self._result)
+
     @property
     def candidates(self):
         """The list of candidate responses.
@@ -301,7 +381,7 @@ class BaseGenerateContentResponse:
 
     @property
     def parts(self):
-        """A quick accessor equivalent to `self.candidates[0].parts`
+        """A quick accessor equivalent to `self.candidates[0].content.parts`
 
         Raises:
             ValueError: If the candidate list does not contain exactly one candidate.
@@ -309,21 +389,20 @@ class BaseGenerateContentResponse:
         candidates = self.candidates
         if not candidates:
             raise ValueError(
-                "The `response.parts` quick accessor only works for a single candidate, "
-                "but none were returned. Check the `response.prompt_feedback` to see if the prompt was blocked."
+                "Invalid operation: The `response.parts` quick accessor requires a single candidate, "
+                "but none were returned. Please check the `response.prompt_feedback` to determine if the prompt was blocked."
             )
         if len(candidates) > 1:
             raise ValueError(
-                "The `response.parts` quick accessor only works with a "
-                "single candidate. With multiple candidates use "
-                "result.candidates[index].text"
+                "Invalid operation: The `response.parts` quick accessor requires a single candidate. "
+                "For multiple candidates, please use `result.candidates[index].text`."
             )
         parts = candidates[0].content.parts
         return parts
 
     @property
     def text(self):
-        """A quick accessor equivalent to `self.candidates[0].parts[0].text`
+        """A quick accessor equivalent to `self.candidates[0].content.parts[0].text`
 
         Raises:
             ValueError: If the candidate list or parts list does not contain exactly one entry.
@@ -331,18 +410,14 @@ class BaseGenerateContentResponse:
         parts = self.parts
         if not parts:
             raise ValueError(
-                "The `response.text` quick accessor only works when the response contains a valid "
-                "`Part`, but none was returned. Check the `candidate.safety_ratings` to see if the "
-                "response was blocked."
+                "Invalid operation: The `response.text` quick accessor requires the response to contain a valid `Part`, "
+                "but none were returned. Please check the `candidate.safety_ratings` to determine if the response was blocked."
             )
-
         if len(parts) != 1 or "text" not in parts[0]:
             raise ValueError(
-                "The `response.text` quick accessor only works for "
-                "simple (single-`Part`) text responses. This response is not simple text. "
-                "Use the `result.parts` accessor or the full "
-                "`result.candidates[index].content.parts` lookup "
-                "instead."
+                "Invalid operation: The `response.text` quick accessor requires a simple (single-`Part`) text response. "
+                "This response is not simple text. Please use the `result.parts` accessor or the full "
+                "`result.candidates[index].content.parts` lookup instead."
             )
         return parts[0].text
 
@@ -350,13 +425,23 @@ class BaseGenerateContentResponse:
     def prompt_feedback(self):
         return self._result.prompt_feedback
 
+    @property
+    def usage_metadata(self):
+        return self._result.usage_metadata
+
     def __str__(self) -> str:
         if self._done:
             _iterator = "None"
         else:
             _iterator = f"<{self._iterator.__class__.__name__}>"
 
-        _result = f"glm.GenerateContentResponse({type(self._result).to_dict(self._result)})"
+        as_dict = type(self._result).to_dict(
+            self._result, use_integers_for_enums=False, including_default_value_fields=False
+        )
+        json_str = json.dumps(as_dict, indent=2)
+
+        _result = f"glm.GenerateContentResponse({json_str})"
+        _result = _result.replace("\n", "\n                    ")
 
         if self._error:
             _error = f",\nerror=<{self._error.__class__.__name__}> {self._error}"

@@ -12,6 +12,8 @@ from google.generativeai import client as client_lib
 from google.generativeai import generative_models
 from google.generativeai.types import content_types
 from google.generativeai.types import generation_types
+from google.generativeai.types import helper_types
+
 
 import PIL.Image
 
@@ -21,53 +23,79 @@ TEST_IMAGE_URL = "https://storage.googleapis.com/generativeai-downloads/data/tes
 TEST_IMAGE_DATA = TEST_IMAGE_PATH.read_bytes()
 
 
+def noop(x: int):
+    return x
+
+
+def simple_part(text: str) -> glm.Content:
+    return glm.Content({"parts": [{"text": text}]})
+
+
+def iter_part(texts: Iterable[str]) -> glm.Content:
+    return glm.Content({"parts": [{"text": t} for t in texts]})
+
+
 def simple_response(text: str) -> glm.GenerateContentResponse:
-    return glm.GenerateContentResponse({"candidates": [{"content": {"parts": [{"text": text}]}}]})
+    return glm.GenerateContentResponse({"candidates": [{"content": simple_part(text)}]})
+
+
+class MockGenerativeServiceClient:
+    def __init__(self, test):
+        self.test = test
+        self.observed_requests = []
+        self.observed_kwargs = []
+        self.responses = collections.defaultdict(list)
+
+    def generate_content(
+        self,
+        request: glm.GenerateContentRequest,
+        **kwargs,
+    ) -> glm.GenerateContentResponse:
+        self.test.assertIsInstance(request, glm.GenerateContentRequest)
+        self.observed_requests.append(request)
+        self.observed_kwargs.append(kwargs)
+        response = self.responses["generate_content"].pop(0)
+        return response
+
+    def stream_generate_content(
+        self,
+        request: glm.GetModelRequest,
+        **kwargs,
+    ) -> Iterable[glm.GenerateContentResponse]:
+        self.observed_requests.append(request)
+        self.observed_kwargs.append(kwargs)
+        response = self.responses["stream_generate_content"].pop(0)
+        return response
+
+    def count_tokens(
+        self,
+        request: glm.CountTokensRequest,
+        **kwargs,
+    ) -> Iterable[glm.GenerateContentResponse]:
+        self.observed_requests.append(request)
+        self.observed_kwargs.append(kwargs)
+        response = self.responses["count_tokens"].pop(0)
+        return response
 
 
 class CUJTests(parameterized.TestCase):
     """Tests are in order with the design doc."""
 
+    @property
+    def observed_requests(self):
+        return self.client.observed_requests
+
+    @property
+    def observed_kwargs(self):
+        return self.client.observed_kwargs
+
+    @property
+    def responses(self):
+        return self.client.responses
+
     def setUp(self):
-        self.client = unittest.mock.MagicMock()
-
+        self.client = MockGenerativeServiceClient(self)
         client_lib._client_manager.clients["generative"] = self.client
-
-        def add_client_method(f):
-            name = f.__name__
-            setattr(self.client, name, f)
-            return f
-
-        self.observed_requests = []
-        self.responses = collections.defaultdict(list)
-
-        @add_client_method
-        def generate_content(
-            request: glm.GenerateContentRequest,
-            **kwargs,
-        ) -> glm.GenerateContentResponse:
-            self.assertIsInstance(request, glm.GenerateContentRequest)
-            self.observed_requests.append(request)
-            response = self.responses["generate_content"].pop(0)
-            return response
-
-        @add_client_method
-        def stream_generate_content(
-            request: glm.GetModelRequest,
-            **kwargs,
-        ) -> Iterable[glm.GenerateContentResponse]:
-            self.observed_requests.append(request)
-            response = self.responses["stream_generate_content"].pop(0)
-            return response
-
-        @add_client_method
-        def count_tokens(
-            request: glm.CountTokensRequest,
-            **kwargs,
-        ) -> Iterable[glm.GenerateContentResponse]:
-            self.observed_requests.append(request)
-            response = self.responses["count_tokens"].pop(0)
-            return response
 
     def test_hello(self):
         # Generate text from text prompt
@@ -143,11 +171,12 @@ class CUJTests(parameterized.TestCase):
 
     @parameterized.named_parameters(
         ["dict", {"danger": "low"}, {"danger": "high"}],
+        ["quick", "low", "high"],
         [
             "list-dict",
             [
                 dict(
-                    category=glm.HarmCategory.HARM_CATEGORY_DANGEROUS,
+                    category=glm.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
                     threshold=glm.SafetySetting.HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
                 ),
             ],
@@ -159,21 +188,21 @@ class CUJTests(parameterized.TestCase):
             "object",
             [
                 glm.SafetySetting(
-                    category=glm.HarmCategory.HARM_CATEGORY_DANGEROUS,
+                    category=glm.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
                     threshold=glm.SafetySetting.HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
                 ),
             ],
             [
                 glm.SafetySetting(
-                    category=glm.HarmCategory.HARM_CATEGORY_DANGEROUS,
-                    threshold=glm.SafetySetting.HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
+                    category=glm.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                    threshold=glm.SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH,
                 ),
             ],
         ],
     )
     def test_safety_overwrite(self, safe1, safe2):
         # Safety
-        model = generative_models.GenerativeModel("gemini-pro", safety_settings={"danger": "low"})
+        model = generative_models.GenerativeModel("gemini-pro", safety_settings=safe1)
 
         self.responses["generate_content"] = [
             simple_response(" world!"),
@@ -181,22 +210,25 @@ class CUJTests(parameterized.TestCase):
         ]
 
         _ = model.generate_content("hello")
+
+        danger = [
+            s
+            for s in self.observed_requests[-1].safety_settings
+            if s.category == glm.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT
+        ]
         self.assertEqual(
-            self.observed_requests[-1].safety_settings[0].category,
-            glm.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-        )
-        self.assertEqual(
-            self.observed_requests[-1].safety_settings[0].threshold,
+            danger[0].threshold,
             glm.SafetySetting.HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
         )
 
-        _ = model.generate_content("hello", safety_settings={"danger": "high"})
+        _ = model.generate_content("hello", safety_settings=safe2)
+        danger = [
+            s
+            for s in self.observed_requests[-1].safety_settings
+            if s.category == glm.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT
+        ]
         self.assertEqual(
-            self.observed_requests[-1].safety_settings[0].category,
-            glm.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-        )
-        self.assertEqual(
-            self.observed_requests[-1].safety_settings[0].threshold,
+            danger[0].threshold,
             glm.SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH,
         )
 
@@ -435,7 +467,7 @@ class CUJTests(parameterized.TestCase):
         chat1 = model.start_chat()
         chat1.send_message("hello1")
 
-        chat2 = copy.deepcopy(chat1)
+        chat2 = copy.copy(chat1)
         chat2.send_message("hello2")
 
         chat1.send_message("hello3")
@@ -606,18 +638,144 @@ class CUJTests(parameterized.TestCase):
             self.assertEqual(type(obr.tools[0]).to_dict(obr.tools[0]), tools)
 
     @parameterized.named_parameters(
-        ["basic", "Hello"],
-        ["list", ["Hello"]],
+        dict(
+            testcase_name="test_FunctionCallingMode_str",
+            tool_config={"function_calling_config": "any"},
+            expected_tool_config={
+                "function_calling_config": {
+                    "mode": content_types.FunctionCallingMode.ANY,
+                    "allowed_function_names": [],
+                }
+            },
+        ),
+        dict(
+            testcase_name="test_FunctionCallingMode_int",
+            tool_config={"function_calling_config": 1},
+            expected_tool_config={
+                "function_calling_config": {
+                    "mode": content_types.FunctionCallingMode.AUTO,
+                    "allowed_function_names": [],
+                }
+            },
+        ),
+        dict(
+            testcase_name="test_FunctionCallingMode",
+            tool_config={"function_calling_config": content_types.FunctionCallingMode.NONE},
+            expected_tool_config={
+                "function_calling_config": {
+                    "mode": content_types.FunctionCallingMode.NONE,
+                    "allowed_function_names": [],
+                }
+            },
+        ),
+        dict(
+            testcase_name="test_glm_FunctionCallingConfig",
+            tool_config={
+                "function_calling_config": glm.FunctionCallingConfig(
+                    mode=content_types.FunctionCallingMode.AUTO
+                )
+            },
+            expected_tool_config={
+                "function_calling_config": {
+                    "mode": content_types.FunctionCallingMode.AUTO,
+                    "allowed_function_names": [],
+                }
+            },
+        ),
+        dict(
+            testcase_name="test_FunctionCallingConfigDict",
+            tool_config={
+                "function_calling_config": {
+                    "mode": "mode_auto",
+                    "allowed_function_names": ["datetime", "greetings", "random"],
+                }
+            },
+            expected_tool_config={
+                "function_calling_config": {
+                    "mode": content_types.FunctionCallingMode.AUTO,
+                    "allowed_function_names": ["datetime", "greetings", "random"],
+                }
+            },
+        ),
+        dict(
+            testcase_name="test_glm_ToolConfig",
+            tool_config=glm.ToolConfig(
+                function_calling_config=glm.FunctionCallingConfig(
+                    mode=content_types.FunctionCallingMode.NONE
+                )
+            ),
+            expected_tool_config={
+                "function_calling_config": {
+                    "mode": content_types.FunctionCallingMode.NONE,
+                    "allowed_function_names": [],
+                }
+            },
+        ),
+    )
+    def test_tool_config(self, tool_config, expected_tool_config):
+        tools = dict(
+            function_declarations=[
+                dict(name="datetime", description="Returns the current UTC date and time."),
+                dict(name="greetings", description="Returns a greeting."),
+                dict(name="random", description="Returns a random number."),
+            ]
+        )
+        self.responses["generate_content"] = [simple_response("echo echo")]
+
+        model = generative_models.GenerativeModel("gemini-pro", tools=tools)
+        _ = model.generate_content("Hello", tools=[tools], tool_config=tool_config)
+
+        req = self.observed_requests[0]
+
+        self.assertLen(type(req.tools[0]).to_dict(req.tools[0]).get("function_declarations"), 3)
+        self.assertEqual(type(req.tool_config).to_dict(req.tool_config), expected_tool_config)
+
+    @parameterized.named_parameters(
+        ["bare_str", "talk like a pirate", simple_part("talk like a pirate")],
+        [
+            "part_dict",
+            {"parts": [{"text": "talk like a pirate"}]},
+            simple_part("talk like a pirate"),
+        ],
+        ["part_list", ["talk like:", "a pirate"], iter_part(["talk like:", "a pirate"])],
+    )
+    def test_system_instruction(self, instruction, expected_instr):
+        self.responses["generate_content"] = [simple_response("echo echo")]
+        model = generative_models.GenerativeModel("gemini-pro", system_instruction=instruction)
+
+        _ = model.generate_content("test")
+
+        [req] = self.observed_requests
+        self.assertEqual(req.system_instruction, expected_instr)
+
+    @parameterized.named_parameters(
+        ["basic", {"contents": "Hello"}],
+        ["list", {"contents": ["Hello"]}],
         [
             "list2",
-            [{"text": "Hello"}, {"inline_data": {"data": b"PNG!", "mime_type": "image/png"}}],
+            {
+                "contents": [
+                    {"text": "Hello"},
+                    {"inline_data": {"data": b"PNG!", "mime_type": "image/png"}},
+                ]
+            },
         ],
-        ["contents", [{"role": "user", "parts": ["hello"]}]],
+        [
+            "contents",
+            {"contents": [{"role": "user", "parts": ["hello"]}]},
+        ],
+        ["empty", {}],
+        [
+            "system_instruction",
+            {"system_instruction": ["You are a cat"]},
+        ],
+        ["tools", {"tools": [noop]}],
     )
-    def test_count_tokens_smoke(self, contents):
+    def test_count_tokens_smoke(self, kwargs):
+        si = kwargs.pop("system_instruction", None)
         self.responses["count_tokens"] = [glm.CountTokensResponse(total_tokens=7)]
-        model = generative_models.GenerativeModel("gemini-pro-vision")
-        response = model.count_tokens(contents)
+        model = generative_models.GenerativeModel("gemini-pro-vision", system_instruction=si)
+        response = model.count_tokens(**kwargs)
         self.assertEqual(type(response).to_dict(response), {"total_tokens": 7})
 
     @parameterized.named_parameters(
@@ -668,7 +826,7 @@ class CUJTests(parameterized.TestCase):
         )
 
         asource = re.sub(" *?# type: ignore", "", asource)
-        self.assertEqual(source, asource)
+        self.assertEqual(source, asource, f"error in {obj=}")
 
     def test_repr_for_unary_non_streamed_response(self):
         model = generative_models.GenerativeModel(model_name="gemini-pro")
@@ -682,9 +840,22 @@ class CUJTests(parameterized.TestCase):
             GenerateContentResponse(
                 done=True,
                 iterator=None,
-                result=glm.GenerateContentResponse({'candidates': [{'content': {'parts': [{'text': 'world!'}], 'role': ''}, 'finish_reason': 0, 'safety_ratings': [], 'token_count': 0, 'grounding_attributions': []}]}),
+                result=glm.GenerateContentResponse({
+                  "candidates": [
+                    {
+                      "content": {
+                        "parts": [
+                          {
+                            "text": "world!"
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }),
             )"""
         )
+
         self.assertEqual(expected, result)
 
     def test_repr_for_streaming_start_to_finish(self):
@@ -702,7 +873,19 @@ class CUJTests(parameterized.TestCase):
             GenerateContentResponse(
                 done=False,
                 iterator=<generator>,
-                result=glm.GenerateContentResponse({'candidates': [{'content': {'parts': [{'text': 'first'}], 'role': ''}, 'finish_reason': 0, 'safety_ratings': [], 'token_count': 0, 'grounding_attributions': []}]}),
+                result=glm.GenerateContentResponse({
+                  "candidates": [
+                    {
+                      "content": {
+                        "parts": [
+                          {
+                            "text": "first"
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }),
             )"""
         )
         self.assertEqual(expected1, result1)
@@ -715,7 +898,23 @@ class CUJTests(parameterized.TestCase):
             GenerateContentResponse(
                 done=False,
                 iterator=<generator>,
-                result=glm.GenerateContentResponse({'candidates': [{'content': {'parts': [{'text': 'first second'}], 'role': ''}, 'index': 0, 'citation_metadata': {'citation_sources': []}, 'finish_reason': 0, 'safety_ratings': [], 'token_count': 0, 'grounding_attributions': []}], 'prompt_feedback': {'block_reason': 0, 'safety_ratings': []}}),
+                result=glm.GenerateContentResponse({
+                  "candidates": [
+                    {
+                      "content": {
+                        "parts": [
+                          {
+                            "text": "first second"
+                          }
+                        ]
+                      },
+                      "index": 0,
+                      "citation_metadata": {}
+                    }
+                  ],
+                  "prompt_feedback": {},
+                  "usage_metadata": {}
+                }),
             )"""
         )
         self.assertEqual(expected2, result2)
@@ -728,7 +927,23 @@ class CUJTests(parameterized.TestCase):
             GenerateContentResponse(
                 done=False,
                 iterator=<generator>,
-                result=glm.GenerateContentResponse({'candidates': [{'content': {'parts': [{'text': 'first second third'}], 'role': ''}, 'index': 0, 'citation_metadata': {'citation_sources': []}, 'finish_reason': 0, 'safety_ratings': [], 'token_count': 0, 'grounding_attributions': []}], 'prompt_feedback': {'block_reason': 0, 'safety_ratings': []}}),
+                result=glm.GenerateContentResponse({
+                  "candidates": [
+                    {
+                      "content": {
+                        "parts": [
+                          {
+                            "text": "first second third"
+                          }
+                        ]
+                      },
+                      "index": 0,
+                      "citation_metadata": {}
+                    }
+                  ],
+                  "prompt_feedback": {},
+                  "usage_metadata": {}
+                }),
             )"""
         )
         self.assertEqual(expected3, result3)
@@ -754,7 +969,11 @@ class CUJTests(parameterized.TestCase):
             GenerateContentResponse(
                 done=False,
                 iterator=<generator>,
-                result=glm.GenerateContentResponse({'prompt_feedback': {'block_reason': 1, 'safety_ratings': []}, 'candidates': []}),
+                result=glm.GenerateContentResponse({
+                  "prompt_feedback": {
+                    "block_reason": "SAFETY"
+                  }
+                }),
             ),
             error=<BlockedPromptException> prompt_feedback {
               block_reason: SAFETY
@@ -800,7 +1019,23 @@ class CUJTests(parameterized.TestCase):
             GenerateContentResponse(
                 done=True,
                 iterator=None,
-                result=glm.GenerateContentResponse({'candidates': [{'content': {'parts': [{'text': '123'}], 'role': ''}, 'index': 0, 'citation_metadata': {'citation_sources': []}, 'finish_reason': 0, 'safety_ratings': [], 'token_count': 0, 'grounding_attributions': []}], 'prompt_feedback': {'block_reason': 0, 'safety_ratings': []}}),
+                result=glm.GenerateContentResponse({
+                  "candidates": [
+                    {
+                      "content": {
+                        "parts": [
+                          {
+                            "text": "123"
+                          }
+                        ]
+                      },
+                      "index": 0,
+                      "citation_metadata": {}
+                    }
+                  ],
+                  "prompt_feedback": {},
+                  "usage_metadata": {}
+                }),
             ),
             error=<ValueError> """
         )
@@ -843,7 +1078,24 @@ class CUJTests(parameterized.TestCase):
             GenerateContentResponse(
                 done=True,
                 iterator=None,
-                result=glm.GenerateContentResponse({'candidates': [{'content': {'parts': [{'text': 'abc'}], 'role': ''}, 'finish_reason': 3, 'index': 0, 'citation_metadata': {'citation_sources': []}, 'safety_ratings': [], 'token_count': 0, 'grounding_attributions': []}], 'prompt_feedback': {'block_reason': 0, 'safety_ratings': []}}),
+                result=glm.GenerateContentResponse({
+                  "candidates": [
+                    {
+                      "content": {
+                        "parts": [
+                          {
+                            "text": "abc"
+                          }
+                        ]
+                      },
+                      "finish_reason": "SAFETY",
+                      "index": 0,
+                      "citation_metadata": {}
+                    }
+                  ],
+                  "prompt_feedback": {},
+                  "usage_metadata": {}
+                }),
             ),
             error=<StopCandidateException> index: 0
             content {
@@ -887,6 +1139,7 @@ class CUJTests(parameterized.TestCase):
                     generation_config={},
                     safety_settings={},
                     tools=None,
+                    system_instruction=None,
                 ),
                 history=[glm.Content({'parts': [{'text': 'I really like fantasy books.'}], 'role': 'user'}), glm.Content({'parts': [{'text': 'first'}], 'role': 'model'}), glm.Content({'parts': [{'text': 'I also like this image.'}, {'inline_data': {'data': 'iVBORw0KGgoA...AAElFTkSuQmCC', 'mime_type': 'image/png'}}], 'role': 'user'}), glm.Content({'parts': [{'text': 'second'}], 'role': 'model'}), glm.Content({'parts': [{'text': 'What things do I like?.'}], 'role': 'user'}), glm.Content({'parts': [{'text': 'third'}], 'role': 'model'})]
             )"""
@@ -914,6 +1167,7 @@ class CUJTests(parameterized.TestCase):
                     generation_config={},
                     safety_settings={},
                     tools=None,
+                    system_instruction=None,
                 ),
                 history=[glm.Content({'parts': [{'text': 'I really like fantasy books.'}], 'role': 'user'}), <STREAMING IN PROGRESS>]
             )"""
@@ -957,22 +1211,43 @@ class CUJTests(parameterized.TestCase):
                     generation_config={},
                     safety_settings={},
                     tools=None,
+                    system_instruction=None,
                 ),
                 history=[glm.Content({'parts': [{'text': 'I really like fantasy books.'}], 'role': 'user'}), <STREAMING ERROR>]
             )"""
         )
         self.assertEqual(expected, result)
 
+    def test_repr_for_system_instruction(self):
+        model = generative_models.GenerativeModel("gemini-pro", system_instruction="Be excellent.")
+        result = repr(model)
+        self.assertIn("system_instruction='Be excellent.'", result)
+
     def test_count_tokens_called_with_request_options(self):
-        self.client.count_tokens = unittest.mock.MagicMock()
-        request = unittest.mock.ANY
+        self.responses["count_tokens"].append(glm.CountTokensResponse())
         request_options = {"timeout": 120}
 
-        self.responses["count_tokens"] = [glm.CountTokensResponse(total_tokens=7)]
         model = generative_models.GenerativeModel("gemini-pro-vision")
         model.count_tokens([{"role": "user", "parts": ["hello"]}], request_options=request_options)
 
-        self.client.count_tokens.assert_called_once_with(request, **request_options)
+        self.assertEqual(request_options, self.observed_kwargs[0])
+
+    def test_chat_with_request_options(self):
+        self.responses["generate_content"].append(
+            glm.GenerateContentResponse(
+                {
+                    "candidates": [{"finish_reason": "STOP"}],
+                }
+            )
+        )
+        request_options = {"timeout": 120}
+
+        model = generative_models.GenerativeModel("gemini-pro")
+        chat = model.start_chat()
+        chat.send_message("hello", request_options=helper_types.RequestOptions(**request_options))
+
+        request_options["retry"] = None
+        self.assertEqual(request_options, self.observed_kwargs[0])
 
 
 if __name__ == "__main__":
